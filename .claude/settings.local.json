@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build --manifest-path src-tauri/Cargo.toml)",
+      "Bash(pnpm check)",
+      "Bash(cargo build --manifest-path src-tauri/Cargo.toml --release)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\klkkk\\.claude\\projects\\d--projects-tauri-PortOpener"
+    ]
+  }
+}
