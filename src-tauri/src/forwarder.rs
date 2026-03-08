@@ -8,6 +8,7 @@ use tokio::io;
 use tokio_util::sync::CancellationToken;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +26,13 @@ pub enum RuleStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleStats {
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub connections: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardRule {
     pub id: String,
     pub name: String,
@@ -33,6 +41,14 @@ pub struct ForwardRule {
     pub target_addr: String,
     pub enabled: bool,
     pub status: RuleStatus,
+    #[serde(default)]
+    pub stats: RuleStats,
+}
+
+impl Default for RuleStats {
+    fn default() -> Self {
+        Self { bytes_up: 0, bytes_down: 0, connections: 0 }
+    }
 }
 
 impl ForwardRule {
@@ -45,26 +61,48 @@ impl ForwardRule {
             target_addr,
             enabled: false,
             status: RuleStatus::Stopped,
+            stats: RuleStats::default(),
+        }
+    }
+}
+
+// Shared atomic counters per rule (not persisted, reset on restart)
+pub struct RuleCounters {
+    pub bytes_up: Arc<AtomicU64>,
+    pub bytes_down: Arc<AtomicU64>,
+    pub connections: Arc<AtomicI64>,
+}
+
+impl RuleCounters {
+    fn new() -> Self {
+        Self {
+            bytes_up: Arc::new(AtomicU64::new(0)),
+            bytes_down: Arc::new(AtomicU64::new(0)),
+            connections: Arc::new(AtomicI64::new(0)),
         }
     }
 }
 
 struct RunningTask {
     cancel: CancellationToken,
+    counters: Arc<RuleCounters>,
 }
 
 pub struct ForwarderState {
     pub rules: HashMap<String, ForwardRule>,
     tasks: HashMap<String, RunningTask>,
-    config_path: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
+    pub log_path: Option<PathBuf>,
 }
 
 impl ForwarderState {
     pub fn with_config_path(config_path: PathBuf) -> Self {
+        let log_path = config_path.parent().map(|p| p.join("portopener.log"));
         Self {
             rules: HashMap::new(),
             tasks: HashMap::new(),
             config_path: Some(config_path),
+            log_path,
         }
     }
 
@@ -72,9 +110,22 @@ impl ForwarderState {
         self.tasks.contains_key(id)
     }
 
+    pub fn get_live_stats(&self, id: &str) -> Option<RuleStats> {
+        self.tasks.get(id).map(|t| RuleStats {
+            bytes_up: t.counters.bytes_up.load(Ordering::Relaxed),
+            bytes_down: t.counters.bytes_down.load(Ordering::Relaxed),
+            connections: t.counters.connections.load(Ordering::Relaxed).max(0) as i64,
+        })
+    }
+
     pub fn save_rules(&self) -> Result<(), String> {
         if let Some(path) = &self.config_path {
-            let rules_vec: Vec<_> = self.rules.values().cloned().collect();
+            // Save only persistent fields (strip runtime stats)
+            let rules_vec: Vec<_> = self.rules.values().map(|r| {
+                let mut r = r.clone();
+                r.stats = RuleStats::default();
+                r
+            }).collect();
             let json = serde_json::to_string_pretty(&rules_vec)
                 .map_err(|e| format!("Serialize error: {e}"))?;
             std::fs::write(path, json)
@@ -90,30 +141,40 @@ impl ForwarderState {
                     .map_err(|e| format!("Read error: {e}"))?;
                 let rules_vec: Vec<ForwardRule> = serde_json::from_str(&json)
                     .map_err(|e| format!("Deserialize error: {e}"))?;
-
                 self.rules.clear();
                 for mut rule in rules_vec {
-                    // Reset runtime state on load
                     rule.enabled = false;
                     rule.status = RuleStatus::Stopped;
+                    rule.stats = RuleStats::default();
                     self.rules.insert(rule.id.clone(), rule);
                 }
             }
         }
         Ok(())
     }
+
+    pub fn read_logs(&self, limit: usize) -> Vec<String> {
+        if let Some(path) = &self.log_path {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+                let start = lines.len().saturating_sub(limit);
+                return lines[start..].to_vec();
+            }
+        }
+        vec![]
+    }
 }
 
 pub type SharedState = Arc<Mutex<ForwarderState>>;
 
 pub async fn start_rule(state: SharedState, id: String) -> Result<(), String> {
-    let (protocol, listen_addr, target_addr) = {
+    let (protocol, listen_addr, target_addr, log_path) = {
         let s = state.lock().await;
         let rule = s.rules.get(&id).ok_or("Rule not found")?;
         if s.tasks.contains_key(&id) {
             return Err("Already running".into());
         }
-        (rule.protocol.clone(), rule.listen_addr.clone(), rule.target_addr.clone())
+        (rule.protocol.clone(), rule.listen_addr.clone(), rule.target_addr.clone(), s.log_path.clone())
     };
 
     let cancel = CancellationToken::new();
@@ -121,10 +182,18 @@ pub async fn start_rule(state: SharedState, id: String) -> Result<(), String> {
     let state_clone = state.clone();
     let id_clone = id.clone();
 
+    let counters = Arc::new(RuleCounters::new());
+    let counters_clone = counters.bytes_up.clone();
+    let counters_down = counters.bytes_down.clone();
+    let counters_conn = counters.connections.clone();
+
     let task = match protocol {
         Protocol::Tcp => {
             tokio::spawn(async move {
-                let result = run_tcp_forward(listen_addr, target_addr, cancel_clone).await;
+                let result = run_tcp_forward(
+                    listen_addr, target_addr, cancel_clone,
+                    counters_clone, counters_down, counters_conn, log_path,
+                ).await;
                 let mut s = state_clone.lock().await;
                 s.tasks.remove(&id_clone);
                 if let Some(rule) = s.rules.get_mut(&id_clone) {
@@ -138,7 +207,10 @@ pub async fn start_rule(state: SharedState, id: String) -> Result<(), String> {
         }
         Protocol::Udp => {
             tokio::spawn(async move {
-                let result = run_udp_forward(listen_addr, target_addr, cancel_clone).await;
+                let result = run_udp_forward(
+                    listen_addr, target_addr, cancel_clone,
+                    counters_clone, counters_down, counters_conn, log_path,
+                ).await;
                 let mut s = state_clone.lock().await;
                 s.tasks.remove(&id_clone);
                 if let Some(rule) = s.rules.get_mut(&id_clone) {
@@ -152,11 +224,10 @@ pub async fn start_rule(state: SharedState, id: String) -> Result<(), String> {
         }
     };
 
-    // Drop the JoinHandle — task runs independently
     drop(task);
 
     let mut s = state.lock().await;
-    s.tasks.insert(id.clone(), RunningTask { cancel });
+    s.tasks.insert(id.clone(), RunningTask { cancel, counters });
     if let Some(rule) = s.rules.get_mut(&id) {
         rule.enabled = true;
         rule.status = RuleStatus::Running;
@@ -176,33 +247,54 @@ pub async fn stop_rule(state: SharedState, id: String) -> Result<(), String> {
     Ok(())
 }
 
+fn log_line(log_path: &Option<PathBuf>, msg: &str) {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let line = format!("[{}] {}", now, msg);
+    if let Some(path) = log_path {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+}
+
 async fn run_tcp_forward(
     listen_addr: String,
     target_addr: String,
     cancel: CancellationToken,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
+    connections: Arc<AtomicI64>,
+    log_path: Option<PathBuf>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(&listen_addr)
         .await
         .map_err(|e| format!("Bind failed: {e}"))?;
 
-    println!("[TCP] Listening on {}", listen_addr);
+    log_line(&log_path, &format!("[TCP] Listening on {}", listen_addr));
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                println!("[TCP] Stopped listening on {}", listen_addr);
+                log_line(&log_path, &format!("[TCP] Stopped {}", listen_addr));
                 break;
             }
             result = listener.accept() => {
                 match result {
                     Ok((client, client_addr)) => {
-                        println!("[TCP] New connection from {} -> {}", client_addr, target_addr);
+                        log_line(&log_path, &format!("[TCP] {} -> {}", client_addr, target_addr));
                         let target = target_addr.clone();
                         let cancel_conn = cancel.clone();
+                        let up = bytes_up.clone();
+                        let down = bytes_down.clone();
+                        let conn = connections.clone();
+                        let lp = log_path.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_tcp_connection(client, target, cancel_conn).await {
-                                eprintln!("[TCP] Connection error: {}", e);
+                            conn.fetch_add(1, Ordering::Relaxed);
+                            if let Err(e) = handle_tcp_connection(client, target, cancel_conn, up, down).await {
+                                log_line(&lp, &format!("[TCP] Connection error: {}", e));
                             }
+                            conn.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                     Err(e) => return Err(format!("Accept error: {e}")),
@@ -217,6 +309,8 @@ async fn handle_tcp_connection(
     client: TcpStream,
     target_addr: String,
     cancel: CancellationToken,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let target = TcpStream::connect(&target_addr).await?;
 
@@ -226,9 +320,33 @@ async fn handle_tcp_connection(
     tokio::select! {
         _ = cancel.cancelled() => {}
         _ = async {
+            let up = bytes_up.clone();
+            let down = bytes_down.clone();
             tokio::join!(
-                io::copy(&mut cr, &mut tw),
-                io::copy(&mut tr, &mut cw),
+                async {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut cr, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                up.fetch_add(n as u64, Ordering::Relaxed);
+                                if tokio::io::AsyncWriteExt::write_all(&mut tw, &buf[..n]).await.is_err() { break; }
+                            }
+                        }
+                    }
+                },
+                async {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut tr, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                down.fetch_add(n as u64, Ordering::Relaxed);
+                                if tokio::io::AsyncWriteExt::write_all(&mut cw, &buf[..n]).await.is_err() { break; }
+                            }
+                        }
+                    }
+                },
             )
         } => {}
     }
@@ -239,6 +357,10 @@ async fn run_udp_forward(
     listen_addr: String,
     target_addr: String,
     cancel: CancellationToken,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
+    connections: Arc<AtomicI64>,
+    log_path: Option<PathBuf>,
 ) -> Result<(), String> {
     let socket = Arc::new(
         UdpSocket::bind(&listen_addr)
@@ -246,15 +368,14 @@ async fn run_udp_forward(
             .map_err(|e| format!("Bind failed: {e}"))?,
     );
 
-    println!("[UDP] Listening on {}", listen_addr);
+    log_line(&log_path, &format!("[UDP] Listening on {}", listen_addr));
 
-    // client_addr -> (outbound socket, last activity time)
     let sessions: Arc<Mutex<HashMap<std::net::SocketAddr, (Arc<UdpSocket>, Instant)>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Spawn cleanup task for idle sessions (60s timeout)
     let sessions_cleanup = sessions.clone();
     let cancel_cleanup = cancel.clone();
+    let conn_cleanup = connections.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -262,15 +383,14 @@ async fn run_udp_forward(
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
                     let mut map = sessions_cleanup.lock().await;
                     let now = Instant::now();
-                    map.retain(|addr, (_, last_activity)| {
-                        let idle = now.duration_since(*last_activity).as_secs();
-                        if idle > 60 {
-                            println!("[UDP] Cleaning up idle session: {}", addr);
-                            false
-                        } else {
-                            true
-                        }
+                    let before = map.len() as i64;
+                    map.retain(|_, (_, last_activity)| {
+                        now.duration_since(*last_activity).as_secs() <= 60
                     });
+                    let removed = before - map.len() as i64;
+                    if removed > 0 {
+                        conn_cleanup.fetch_sub(removed, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -281,7 +401,7 @@ async fn run_udp_forward(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                println!("[UDP] Stopped listening on {}", listen_addr);
+                log_line(&log_path, &format!("[UDP] Stopped {}", listen_addr));
                 break;
             }
             result = socket.recv_from(&mut buf) => {
@@ -292,10 +412,13 @@ async fn run_udp_forward(
                         let target = target_addr.clone();
                         let inbound = socket.clone();
                         let sessions = sessions.clone();
-
+                        let up = bytes_up.clone();
+                        let down = bytes_down.clone();
+                        let conn = connections.clone();
+                        let lp = log_path.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_udp_packet(
-                                data, client_addr, target, inbound, sessions
+                                data, client_addr, target, inbound, sessions, up, down, conn, lp,
                             ).await {
                                 eprintln!("[UDP] Packet error: {}", e);
                             }
@@ -314,6 +437,10 @@ async fn handle_udp_packet(
     target_addr: String,
     inbound: Arc<UdpSocket>,
     sessions: Arc<Mutex<HashMap<std::net::SocketAddr, (Arc<UdpSocket>, Instant)>>>,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
+    connections: Arc<AtomicI64>,
+    log_path: Option<PathBuf>,
 ) -> io::Result<()> {
     let outbound = {
         let mut map = sessions.lock().await;
@@ -324,20 +451,22 @@ async fn handle_udp_packet(
             let s = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
             s.connect(&target_addr).await?;
             map.insert(client_addr, (s.clone(), Instant::now()));
+            connections.fetch_add(1, Ordering::Relaxed);
+            log_line(&log_path, &format!("[UDP] New session: {} -> {}", client_addr, target_addr));
 
-            // Spawn reverse path: target -> client
             let s_clone = s.clone();
             let inbound_clone = inbound.clone();
             let sessions_clone = sessions.clone();
+            let down = bytes_down.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
                 loop {
                     match s_clone.recv(&mut buf).await {
                         Ok(n) => {
-                            // Update last activity time
                             if let Some((_, last_activity)) = sessions_clone.lock().await.get_mut(&client_addr) {
                                 *last_activity = Instant::now();
                             }
+                            down.fetch_add(n as u64, Ordering::Relaxed);
                             let _ = inbound_clone.send_to(&buf[..n], client_addr).await;
                         }
                         Err(_) => break,
@@ -349,6 +478,7 @@ async fn handle_udp_packet(
         }
     };
 
+    bytes_up.fetch_add(data.len() as u64, Ordering::Relaxed);
     outbound.send(&data).await?;
     Ok(())
 }

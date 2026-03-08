@@ -5,6 +5,12 @@
   type Protocol = "tcp" | "udp";
   type RuleStatus = "stopped" | "running" | { error: string };
 
+  interface RuleStats {
+    bytes_up: number;
+    bytes_down: number;
+    connections: number;
+  }
+
   interface ForwardRule {
     id: string;
     name: string;
@@ -13,12 +19,16 @@
     target_addr: string;
     enabled: boolean;
     status: RuleStatus;
+    stats: RuleStats;
   }
 
   let rules = $state<ForwardRule[]>([]);
   let showModal = $state(false);
+  let showLogs = $state(false);
   let loading = $state<Record<string, boolean>>({});
   let errorMsg = $state("");
+  let searchQuery = $state("");
+  let logs = $state<string[]>([]);
   let refreshInterval: number;
 
   let form = $state({
@@ -27,6 +37,17 @@
     listen_addr: "",
     target_addr: "",
   });
+
+  let filteredRules = $derived(
+    searchQuery.trim()
+      ? rules.filter(r =>
+          r.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          r.listen_addr.includes(searchQuery) ||
+          r.target_addr.includes(searchQuery) ||
+          r.protocol.includes(searchQuery.toLowerCase())
+        )
+      : rules
+  );
 
   async function loadRules() {
     try {
@@ -41,18 +62,15 @@
       errorMsg = "Listen address and target address are required";
       return;
     }
-
-    // Validate address format (host:port)
     const addrPattern = /^.+:\d+$/;
     if (!addrPattern.test(form.listen_addr)) {
-      errorMsg = "Listen address must be in format host:port (e.g., 0.0.0.0:8080)";
+      errorMsg = "Listen address must be in format host:port";
       return;
     }
     if (!addrPattern.test(form.target_addr)) {
-      errorMsg = "Target address must be in format host:port (e.g., 192.168.1.1:80)";
+      errorMsg = "Target address must be in format host:port";
       return;
     }
-
     try {
       await invoke("add_rule", { req: form });
       showModal = false;
@@ -96,6 +114,56 @@
     }
   }
 
+  async function exportRules() {
+    try {
+      const json = await invoke<string>("export_rules");
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "portopener-rules.json";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function importRules() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const count = await invoke<number>("import_rules", { json: text });
+        await loadRules();
+        alert(`Imported ${count} rule(s)`);
+      } catch (e) {
+        alert(String(e));
+      }
+    };
+    input.click();
+  }
+
+  async function openLogs() {
+    try {
+      logs = await invoke<string[]>("get_logs", { limit: 200 });
+      showLogs = true;
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  function formatBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+
   function statusLabel(status: RuleStatus): string {
     if (status === "running") return "Running";
     if (status === "stopped") return "Stopped";
@@ -110,18 +178,15 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape" && showModal) {
-      showModal = false;
-      errorMsg = "";
+    if (e.key === "Escape") {
+      if (showLogs) { showLogs = false; return; }
+      if (showModal) { showModal = false; errorMsg = ""; }
     }
   }
 
   onMount(() => {
     loadRules();
-    // Auto-refresh every 2 seconds to keep UI in sync
     refreshInterval = setInterval(loadRules, 2000);
-
-    // Add global keyboard listener
     window.addEventListener("keydown", handleKeydown);
   });
 
@@ -134,12 +199,25 @@
 <div class="app">
   <header>
     <h1>Port Forwarder</h1>
-    <button class="btn-primary" onclick={() => (showModal = true)}>+ Add Rule</button>
+    <div class="header-actions">
+      <input
+        class="search"
+        type="text"
+        placeholder="Search rules..."
+        bind:value={searchQuery}
+      />
+      <button class="btn-secondary" onclick={openLogs}>Logs</button>
+      <button class="btn-secondary" onclick={importRules}>Import</button>
+      <button class="btn-secondary" onclick={exportRules}>Export</button>
+      <button class="btn-primary" onclick={() => (showModal = true)}>+ Add Rule</button>
+    </div>
   </header>
 
   <div class="table-wrap">
-    {#if rules.length === 0}
-      <div class="empty">No forwarding rules yet. Click "Add Rule" to get started.</div>
+    {#if filteredRules.length === 0}
+      <div class="empty">
+        {searchQuery ? "No rules match your search." : 'No forwarding rules yet. Click "Add Rule" to get started.'}
+      </div>
     {:else}
       <table>
         <thead>
@@ -149,17 +227,27 @@
             <th>Listen</th>
             <th>Target</th>
             <th>Status</th>
+            <th>Conns</th>
+            <th>Up / Down</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          {#each rules as rule (rule.id)}
+          {#each filteredRules as rule (rule.id)}
             <tr>
               <td>{rule.name || "—"}</td>
               <td><span class="badge badge-{rule.protocol}">{rule.protocol.toUpperCase()}</span></td>
               <td class="mono">{rule.listen_addr}</td>
               <td class="mono">{rule.target_addr}</td>
               <td><span class="status {statusClass(rule.status)}">{statusLabel(rule.status)}</span></td>
+              <td class="mono dim">{rule.enabled ? rule.stats.connections : "—"}</td>
+              <td class="mono dim">
+                {#if rule.enabled || rule.stats.bytes_up > 0}
+                  {formatBytes(rule.stats.bytes_up)} / {formatBytes(rule.stats.bytes_down)}
+                {:else}
+                  —
+                {/if}
+              </td>
               <td class="actions">
                 <button
                   class="btn-sm {rule.enabled ? 'btn-stop' : 'btn-start'}"
@@ -224,6 +312,26 @@
   </div>
 {/if}
 
+{#if showLogs}
+  <div class="overlay" onclick={() => (showLogs = false)} role="presentation">
+    <div class="modal modal-logs" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Logs" tabindex="-1">
+      <div class="logs-header">
+        <h2>Logs</h2>
+        <button class="btn-secondary btn-sm" onclick={() => (showLogs = false)}>Close</button>
+      </div>
+      <div class="logs-body">
+        {#if logs.length === 0}
+          <span class="dim">No logs yet.</span>
+        {:else}
+          {#each logs as line}
+            <div class="log-line">{line}</div>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   :global(*, *::before, *::after) { box-sizing: border-box; }
   :global(body) {
@@ -235,7 +343,7 @@
   }
 
   .app {
-    max-width: 900px;
+    max-width: 1100px;
     margin: 0 auto;
     padding: 32px 24px;
   }
@@ -245,6 +353,7 @@
     align-items: center;
     justify-content: space-between;
     margin-bottom: 24px;
+    gap: 12px;
   }
 
   h1 {
@@ -252,7 +361,27 @@
     font-size: 20px;
     font-weight: 600;
     color: #f1f5f9;
+    white-space: nowrap;
   }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .search {
+    padding: 7px 12px;
+    background: #1a1d27;
+    border: 1px solid #2d3148;
+    border-radius: 6px;
+    color: #e2e8f0;
+    font-size: 13px;
+    outline: none;
+    width: 180px;
+  }
+  .search:focus { border-color: #3b82f6; }
+  .search::placeholder { color: #475569; }
 
   .table-wrap {
     background: #1a1d27;
@@ -293,6 +422,7 @@
   tr:hover td { background: #1e2235; }
 
   .mono { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 13px; }
+  .dim { color: #64748b; }
 
   .badge {
     display: inline-block;
@@ -344,7 +474,6 @@
   .btn-danger { background: #1f1f1f; color: #f87171; border: 1px solid #3f1f1f; }
   .btn-danger:hover:not(:disabled) { background: #3f1f1f; }
 
-  /* Modal */
   .overlay {
     position: fixed;
     inset: 0;
@@ -365,6 +494,39 @@
     flex-direction: column;
     gap: 16px;
   }
+
+  .modal-logs {
+    width: 700px;
+    max-width: 90vw;
+    padding: 20px;
+    gap: 12px;
+  }
+
+  .logs-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .logs-body {
+    background: #0f1117;
+    border: 1px solid #2d3148;
+    border-radius: 6px;
+    padding: 12px;
+    max-height: 60vh;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    color: #94a3b8;
+  }
+
+  .log-line {
+    padding: 2px 0;
+    border-bottom: 1px solid #1e2235;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-line:last-child { border-bottom: none; }
 
   .modal h2 { margin: 0; font-size: 16px; font-weight: 600; color: #f1f5f9; }
 

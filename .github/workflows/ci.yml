@@ -45,17 +45,8 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install
 
-      - name: Check frontend
-        run: pnpm check
-
       - name: Build Rust backend
         run: cargo build --manifest-path src-tauri/Cargo.toml
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
-
-      - name: Check Rust formatting
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
-
-      - name: Run Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings

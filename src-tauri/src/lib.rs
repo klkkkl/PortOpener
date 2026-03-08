@@ -14,10 +14,18 @@ pub struct CreateRuleRequest {
     target_addr: String,
 }
 
-
 #[tauri::command]
 async fn list_rules(state: State<'_, SharedState>) -> Result<Vec<ForwardRule>, String> {
-    let s = state.lock().await;
+    let mut s = state.lock().await;
+    // Inject live stats into each running rule
+    let ids: Vec<String> = s.rules.keys().cloned().collect();
+    for id in ids {
+        if let Some(stats) = s.get_live_stats(&id) {
+            if let Some(rule) = s.rules.get_mut(&id) {
+                rule.stats = stats;
+            }
+        }
+    }
     Ok(s.rules.values().cloned().collect())
 }
 
@@ -54,9 +62,39 @@ async fn stop_rule(state: State<'_, SharedState>, id: String) -> Result<(), Stri
     forwarder::stop_rule(state.inner().clone(), id).await
 }
 
+#[tauri::command]
+async fn export_rules(state: State<'_, SharedState>) -> Result<String, String> {
+    let s = state.lock().await;
+    let rules: Vec<_> = s.rules.values().cloned().collect();
+    serde_json::to_string_pretty(&rules).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn import_rules(state: State<'_, SharedState>, json: String) -> Result<usize, String> {
+    let incoming: Vec<ForwardRule> = serde_json::from_str(&json)
+        .map_err(|e| format!("Invalid JSON: {e}"))?;
+    let count = incoming.len();
+    let mut s = state.lock().await;
+    for mut rule in incoming {
+        // Reset runtime state, generate new id to avoid conflicts
+        rule.id = uuid::Uuid::new_v4().to_string();
+        rule.enabled = false;
+        rule.status = forwarder::RuleStatus::Stopped;
+        rule.stats = forwarder::RuleStats::default();
+        s.rules.insert(rule.id.clone(), rule);
+    }
+    s.save_rules()?;
+    Ok(count)
+}
+
+#[tauri::command]
+async fn get_logs(state: State<'_, SharedState>, limit: usize) -> Result<Vec<String>, String> {
+    let s = state.lock().await;
+    Ok(s.read_logs(limit))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize state with config path
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap())
         .join("portopener");
@@ -80,6 +118,9 @@ pub fn run() {
             remove_rule,
             start_rule,
             stop_rule,
+            export_rules,
+            import_rules,
+            get_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
