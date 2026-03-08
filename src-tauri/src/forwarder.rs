@@ -35,6 +35,8 @@ pub struct RuleStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardRule {
     pub id: String,
+    #[serde(default)]
+    pub order: u64,
     pub name: String,
     pub protocol: Protocol,
     pub listen_addr: String,
@@ -52,9 +54,10 @@ impl Default for RuleStats {
 }
 
 impl ForwardRule {
-    pub fn new(name: String, protocol: Protocol, listen_addr: String, target_addr: String) -> Self {
+    pub fn new(order: u64, name: String, protocol: Protocol, listen_addr: String, target_addr: String) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
+            order,
             name,
             protocol,
             listen_addr,
@@ -93,6 +96,7 @@ pub struct ForwarderState {
     tasks: HashMap<String, RunningTask>,
     pub config_path: Option<PathBuf>,
     pub log_path: Option<PathBuf>,
+    next_order: u64,
 }
 
 impl ForwarderState {
@@ -103,7 +107,14 @@ impl ForwarderState {
             tasks: HashMap::new(),
             config_path: Some(config_path),
             log_path,
+            next_order: 0,
         }
+    }
+
+    pub fn next_order(&mut self) -> u64 {
+        let o = self.next_order;
+        self.next_order += 1;
+        o
     }
 
     pub fn is_running(&self, id: &str) -> bool {
@@ -142,12 +153,17 @@ impl ForwarderState {
                 let rules_vec: Vec<ForwardRule> = serde_json::from_str(&json)
                     .map_err(|e| format!("Deserialize error: {e}"))?;
                 self.rules.clear();
+                let mut max_order = 0u64;
                 for mut rule in rules_vec {
                     rule.enabled = false;
                     rule.status = RuleStatus::Stopped;
                     rule.stats = RuleStats::default();
+                    if rule.order >= max_order {
+                        max_order = rule.order + 1;
+                    }
                     self.rules.insert(rule.id.clone(), rule);
                 }
+                self.next_order = max_order;
             }
         }
         Ok(())
@@ -258,6 +274,14 @@ fn log_line(log_path: &Option<PathBuf>, msg: &str) {
     }
 }
 
+fn hex_dump(data: &[u8]) -> String {
+    data.chunks(16).map(|row| {
+        let hex: Vec<String> = row.iter().map(|b| format!("{:02x}", b)).collect();
+        let ascii: String = row.iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' }).collect();
+        format!("  {:47}  |{}|", hex.join(" "), ascii)
+    }).collect::<Vec<_>>().join("\n")
+}
+
 async fn run_tcp_forward(
     listen_addr: String,
     target_addr: String,
@@ -336,7 +360,7 @@ async fn handle_tcp_connection(
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 up.fetch_add(n as u64, Ordering::Relaxed);
-                                log_line(&lp_up, &format!("[TCP] DATA {} -> {} {} bytes", ca, ta, n));
+                                log_line(&lp_up, &format!("[TCP] DATA {} -> {} {} bytes\n{}", ca, ta, n, hex_dump(&buf[..n])));
                                 if tokio::io::AsyncWriteExt::write_all(&mut tw, &buf[..n]).await.is_err() { break; }
                             }
                         }
@@ -349,7 +373,7 @@ async fn handle_tcp_connection(
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 down.fetch_add(n as u64, Ordering::Relaxed);
-                                log_line(&lp_down, &format!("[TCP] DATA {} <- {} {} bytes", ca, ta, n));
+                                log_line(&lp_down, &format!("[TCP] DATA {} <- {} {} bytes\n{}", ca, ta, n, hex_dump(&buf[..n])));
                                 if tokio::io::AsyncWriteExt::write_all(&mut cw, &buf[..n]).await.is_err() { break; }
                             }
                         }
@@ -467,6 +491,8 @@ async fn handle_udp_packet(
             let inbound_clone = inbound.clone();
             let sessions_clone = sessions.clone();
             let down = bytes_down.clone();
+            let lp_down = log_path.clone();
+            let ta_down = target_addr.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
                 loop {
@@ -476,6 +502,7 @@ async fn handle_udp_packet(
                                 *last_activity = Instant::now();
                             }
                             down.fetch_add(n as u64, Ordering::Relaxed);
+                            log_line(&lp_down, &format!("[UDP] DATA {} <- {} {} bytes\n{}", client_addr, ta_down, n, hex_dump(&buf[..n])));
                             let _ = inbound_clone.send_to(&buf[..n], client_addr).await;
                         }
                         Err(_) => break,
@@ -487,7 +514,9 @@ async fn handle_udp_packet(
         }
     };
 
-    bytes_up.fetch_add(data.len() as u64, Ordering::Relaxed);
+    let n = data.len();
+    bytes_up.fetch_add(n as u64, Ordering::Relaxed);
+    log_line(&log_path, &format!("[UDP] DATA {} -> {} {} bytes\n{}", client_addr, target_addr, n, hex_dump(&data)));
     outbound.send(&data).await?;
     Ok(())
 }

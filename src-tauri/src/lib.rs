@@ -26,7 +26,9 @@ async fn list_rules(state: State<'_, SharedState>) -> Result<Vec<ForwardRule>, S
             }
         }
     }
-    Ok(s.rules.values().cloned().collect())
+    let mut rules: Vec<_> = s.rules.values().cloned().collect();
+    rules.sort_by_key(|r| r.order);
+    Ok(rules)
 }
 
 #[tauri::command]
@@ -34,8 +36,9 @@ async fn add_rule(
     state: State<'_, SharedState>,
     req: CreateRuleRequest,
 ) -> Result<ForwardRule, String> {
-    let rule = ForwardRule::new(req.name, req.protocol, req.listen_addr, req.target_addr);
     let mut s = state.lock().await;
+    let order = s.next_order();
+    let rule = ForwardRule::new(order, req.name, req.protocol, req.listen_addr, req.target_addr);
     s.rules.insert(rule.id.clone(), rule.clone());
     s.save_rules()?;
     Ok(rule)
@@ -76,8 +79,8 @@ async fn import_rules(state: State<'_, SharedState>, json: String) -> Result<usi
     let count = incoming.len();
     let mut s = state.lock().await;
     for mut rule in incoming {
-        // Reset runtime state, generate new id to avoid conflicts
         rule.id = uuid::Uuid::new_v4().to_string();
+        rule.order = s.next_order();
         rule.enabled = false;
         rule.status = forwarder::RuleStatus::Stopped;
         rule.stats = forwarder::RuleStats::default();
@@ -91,6 +94,24 @@ async fn import_rules(state: State<'_, SharedState>, json: String) -> Result<usi
 async fn get_logs(state: State<'_, SharedState>, limit: usize) -> Result<Vec<String>, String> {
     let s = state.lock().await;
     Ok(s.read_logs(limit))
+}
+
+#[tauri::command]
+async fn get_log_path(state: State<'_, SharedState>) -> Result<String, String> {
+    let s = state.lock().await;
+    s.log_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or("Log path not set".into())
+}
+
+#[tauri::command]
+async fn clear_logs(state: State<'_, SharedState>) -> Result<(), String> {
+    let s = state.lock().await;
+    if let Some(path) = &s.log_path {
+        std::fs::write(path, "").map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -148,6 +169,8 @@ pub fn run() {
             export_rules,
             import_rules,
             get_logs,
+            get_log_path,
+            clear_logs,
             update_rule,
         ])
         .run(tauri::generate_context!())

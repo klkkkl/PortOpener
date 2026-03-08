@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { openPath } from "@tauri-apps/plugin-opener";
   import { onMount, onDestroy, tick } from "svelte";
 
   type Protocol = "tcp" | "udp";
@@ -13,6 +14,7 @@
 
   interface ForwardRule {
     id: string;
+    order: number;
     name: string;
     protocol: Protocol;
     listen_addr: string;
@@ -57,7 +59,7 @@
 
   async function loadLogs() {
     try {
-      const newLogs = await invoke<string[]>("get_logs", { limit: 300 });
+      const newLogs = await invoke<string[]>("get_logs", { limit: 1000 });
       logs = newLogs;
       await tick();
       if (logsEl) logsEl.scrollTop = logsEl.scrollHeight;
@@ -162,6 +164,24 @@
       alert(String(e));
     } finally {
       loading[rule.id] = false;
+    }
+  }
+
+  async function clearLogs() {
+    try {
+      await invoke("clear_logs");
+      logs = [];
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function openLogFile() {
+    try {
+      const path = await invoke<string>("get_log_path");
+      await openPath(path);
+    } catch (e) {
+      alert(String(e));
     }
   }
 
@@ -313,7 +333,10 @@
   <div class="log-panel">
     <div class="log-panel-header">
       <span>Logs</span>
-      <button class="btn-sm btn-secondary" onclick={() => { logs = []; }}>Clear</button>
+      <div style="display:flex;gap:6px">
+        <button class="btn-sm btn-secondary" onclick={openLogFile}>Open File</button>
+        <button class="btn-sm btn-secondary" onclick={clearLogs}>Clear</button>
+      </div>
     </div>
     <div class="log-body" bind:this={logsEl}>
       {#if logs.length === 0}
