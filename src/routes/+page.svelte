@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
 
   type Protocol = "tcp" | "udp";
   type RuleStatus = "stopped" | "running" | { error: string };
@@ -23,31 +23,29 @@
   }
 
   let rules = $state<ForwardRule[]>([]);
-  let showModal = $state(false);
-  let showLogs = $state(false);
+  let showAddModal = $state(false);
+  let editingRule = $state<ForwardRule | null>(null);
   let loading = $state<Record<string, boolean>>({});
-  let errorMsg = $state("");
-  let searchQuery = $state("");
+  let addErrorMsg = $state("");
+  let editErrorMsg = $state("");
   let logs = $state<string[]>([]);
+  let logsEl = $state<HTMLDivElement | null>(null);
   let refreshInterval: number;
+  let logInterval: number;
 
-  let form = $state({
+  let addForm = $state({
     name: "",
     protocol: "tcp" as Protocol,
     listen_addr: "",
     target_addr: "",
   });
 
-  let filteredRules = $derived(
-    searchQuery.trim()
-      ? rules.filter(r =>
-          r.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          r.listen_addr.includes(searchQuery) ||
-          r.target_addr.includes(searchQuery) ||
-          r.protocol.includes(searchQuery.toLowerCase())
-        )
-      : rules
-  );
+  let editForm = $state({
+    name: "",
+    protocol: "tcp" as Protocol,
+    listen_addr: "",
+    target_addr: "",
+  });
 
   async function loadRules() {
     try {
@@ -57,29 +55,82 @@
     }
   }
 
+  async function loadLogs() {
+    try {
+      const newLogs = await invoke<string[]>("get_logs", { limit: 300 });
+      logs = newLogs;
+      await tick();
+      if (logsEl) logsEl.scrollTop = logsEl.scrollHeight;
+    } catch {
+      // ignore
+    }
+  }
+
   async function addRule() {
-    if (!form.listen_addr || !form.target_addr) {
-      errorMsg = "Listen address and target address are required";
+    if (!addForm.listen_addr || !addForm.target_addr) {
+      addErrorMsg = "Listen address and target address are required";
       return;
     }
     const addrPattern = /^.+:\d+$/;
-    if (!addrPattern.test(form.listen_addr)) {
-      errorMsg = "Listen address must be in format host:port";
+    if (!addrPattern.test(addForm.listen_addr)) {
+      addErrorMsg = "Listen address must be in format host:port";
       return;
     }
-    if (!addrPattern.test(form.target_addr)) {
-      errorMsg = "Target address must be in format host:port";
+    if (!addrPattern.test(addForm.target_addr)) {
+      addErrorMsg = "Target address must be in format host:port";
       return;
     }
     try {
-      await invoke("add_rule", { req: form });
-      showModal = false;
-      form = { name: "", protocol: "tcp", listen_addr: "", target_addr: "" };
-      errorMsg = "";
+      await invoke("add_rule", { req: addForm });
+      showAddModal = false;
+      addForm = { name: "", protocol: "tcp", listen_addr: "", target_addr: "" };
+      addErrorMsg = "";
       await loadRules();
     } catch (e) {
-      errorMsg = String(e);
+      addErrorMsg = String(e);
     }
+  }
+
+  function openEdit(rule: ForwardRule) {
+    editingRule = rule;
+    editForm = {
+      name: rule.name,
+      protocol: rule.protocol,
+      listen_addr: rule.listen_addr,
+      target_addr: rule.target_addr,
+    };
+    editErrorMsg = "";
+  }
+
+  async function saveEdit() {
+    if (!editingRule) return;
+    if (!editForm.listen_addr || !editForm.target_addr) {
+      editErrorMsg = "Listen address and target address are required";
+      return;
+    }
+    const addrPattern = /^.+:\d+$/;
+    if (!addrPattern.test(editForm.listen_addr)) {
+      editErrorMsg = "Listen address must be in format host:port";
+      return;
+    }
+    if (!addrPattern.test(editForm.target_addr)) {
+      editErrorMsg = "Target address must be in format host:port";
+      return;
+    }
+    try {
+      await invoke("update_rule", {
+        req: { id: editingRule.id, ...editForm },
+      });
+      editingRule = null;
+      await loadRules();
+    } catch (e) {
+      editErrorMsg = String(e);
+    }
+  }
+
+  function cancelEdit() {
+    editingRule = null;
+    editErrorMsg = "";
   }
 
   async function toggleRule(rule: ForwardRule) {
@@ -148,15 +199,6 @@
     input.click();
   }
 
-  async function openLogs() {
-    try {
-      logs = await invoke<string[]>("get_logs", { limit: 200 });
-      showLogs = true;
-    } catch (e) {
-      alert(String(e));
-    }
-  }
-
   function formatBytes(n: number): string {
     if (n < 1024) return `${n} B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -177,21 +219,27 @@
     return "status-stopped";
   }
 
+  // Add modal: only ESC closes it (not edit modal)
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      if (showLogs) { showLogs = false; return; }
-      if (showModal) { showModal = false; errorMsg = ""; }
+    if (e.key === "Escape" && showAddModal) {
+      showAddModal = false;
+      addErrorMsg = "";
     }
   }
 
   onMount(() => {
     loadRules();
+    loadLogs();
     refreshInterval = setInterval(loadRules, 2000);
+    logInterval = setInterval(loadLogs, 2000);
     window.addEventListener("keydown", handleKeydown);
+    // Disable context menu
+    window.addEventListener("contextmenu", (e) => e.preventDefault());
   });
 
   onDestroy(() => {
     if (refreshInterval) clearInterval(refreshInterval);
+    if (logInterval) clearInterval(logInterval);
     window.removeEventListener("keydown", handleKeydown);
   });
 </script>
@@ -200,24 +248,15 @@
   <header>
     <h1>Port Forwarder</h1>
     <div class="header-actions">
-      <input
-        class="search"
-        type="text"
-        placeholder="Search rules..."
-        bind:value={searchQuery}
-      />
-      <button class="btn-secondary" onclick={openLogs}>Logs</button>
       <button class="btn-secondary" onclick={importRules}>Import</button>
       <button class="btn-secondary" onclick={exportRules}>Export</button>
-      <button class="btn-primary" onclick={() => (showModal = true)}>+ Add Rule</button>
+      <button class="btn-primary" onclick={() => (showAddModal = true)}>+ Add Rule</button>
     </div>
   </header>
 
   <div class="table-wrap">
-    {#if filteredRules.length === 0}
-      <div class="empty">
-        {searchQuery ? "No rules match your search." : 'No forwarding rules yet. Click "Add Rule" to get started.'}
-      </div>
+    {#if rules.length === 0}
+      <div class="empty">No forwarding rules yet. Click "Add Rule" to get started.</div>
     {:else}
       <table>
         <thead>
@@ -233,8 +272,8 @@
           </tr>
         </thead>
         <tbody>
-          {#each filteredRules as rule (rule.id)}
-            <tr>
+          {#each rules as rule (rule.id)}
+            <tr ondblclick={() => openEdit(rule)} title="Double-click to edit">
               <td>{rule.name || "—"}</td>
               <td><span class="badge badge-{rule.protocol}">{rule.protocol.toUpperCase()}</span></td>
               <td class="mono">{rule.listen_addr}</td>
@@ -252,14 +291,14 @@
                 <button
                   class="btn-sm {rule.enabled ? 'btn-stop' : 'btn-start'}"
                   disabled={loading[rule.id]}
-                  onclick={() => toggleRule(rule)}
+                  onclick={(e) => { e.stopPropagation(); toggleRule(rule); }}
                 >
                   {loading[rule.id] ? "..." : rule.enabled ? "Stop" : "Start"}
                 </button>
                 <button
                   class="btn-sm btn-danger"
                   disabled={loading[rule.id] || rule.enabled}
-                  onclick={() => removeRule(rule)}
+                  onclick={(e) => { e.stopPropagation(); removeRule(rule); }}
                 >
                   Delete
                 </button>
@@ -270,63 +309,99 @@
       </table>
     {/if}
   </div>
+
+  <div class="log-panel">
+    <div class="log-panel-header">
+      <span>Logs</span>
+      <button class="btn-sm btn-secondary" onclick={() => { logs = []; }}>Clear</button>
+    </div>
+    <div class="log-body" bind:this={logsEl}>
+      {#if logs.length === 0}
+        <span class="dim">No logs yet.</span>
+      {:else}
+        {#each logs as line}
+          <div class="log-line">{line}</div>
+        {/each}
+      {/if}
+    </div>
+  </div>
 </div>
 
-{#if showModal}
-  <div class="overlay" onclick={() => (showModal = false)} role="presentation">
+<!-- Add Rule Modal -->
+{#if showAddModal}
+  <div class="overlay" onclick={() => { showAddModal = false; addErrorMsg = ""; }} role="presentation">
     <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Add forwarding rule" tabindex="-1">
       <h2>Add Forwarding Rule</h2>
 
-      {#if errorMsg}
-        <div class="error-banner">{errorMsg}</div>
+      {#if addErrorMsg}
+        <div class="error-banner">{addErrorMsg}</div>
       {/if}
 
       <label>
         Name (optional)
-        <input bind:value={form.name} placeholder="e.g. My SSH Tunnel" onkeydown={(e) => e.key === "Enter" && addRule()} />
+        <input bind:value={addForm.name} placeholder="e.g. My SSH Tunnel" onkeydown={(e) => e.key === "Enter" && addRule()} />
       </label>
-
       <label>
         Protocol
-        <select bind:value={form.protocol}>
+        <select bind:value={addForm.protocol}>
           <option value="tcp">TCP</option>
           <option value="udp">UDP</option>
         </select>
       </label>
-
       <label>
         Listen Address
-        <input bind:value={form.listen_addr} placeholder="0.0.0.0:8080" onkeydown={(e) => e.key === "Enter" && addRule()} />
+        <input bind:value={addForm.listen_addr} placeholder="0.0.0.0:8080" onkeydown={(e) => e.key === "Enter" && addRule()} />
       </label>
-
       <label>
         Target Address
-        <input bind:value={form.target_addr} placeholder="192.168.1.1:80" onkeydown={(e) => e.key === "Enter" && addRule()} />
+        <input bind:value={addForm.target_addr} placeholder="192.168.1.1:80" onkeydown={(e) => e.key === "Enter" && addRule()} />
       </label>
 
       <div class="modal-actions">
-        <button class="btn-secondary" onclick={() => { showModal = false; errorMsg = ""; }}>Cancel</button>
+        <button class="btn-secondary" onclick={() => { showAddModal = false; addErrorMsg = ""; }}>Cancel</button>
         <button class="btn-primary" onclick={addRule}>Add</button>
       </div>
     </div>
   </div>
 {/if}
 
-{#if showLogs}
-  <div class="overlay" onclick={() => (showLogs = false)} role="presentation">
-    <div class="modal modal-logs" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Logs" tabindex="-1">
-      <div class="logs-header">
-        <h2>Logs</h2>
-        <button class="btn-secondary btn-sm" onclick={() => (showLogs = false)}>Close</button>
-      </div>
-      <div class="logs-body">
-        {#if logs.length === 0}
-          <span class="dim">No logs yet.</span>
-        {:else}
-          {#each logs as line}
-            <div class="log-line">{line}</div>
-          {/each}
-        {/if}
+<!-- Edit Rule Modal — only Save/Cancel can close it -->
+{#if editingRule}
+  <div class="overlay" role="presentation">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Edit forwarding rule" tabindex="-1">
+      <h2>Edit Rule</h2>
+
+      {#if editErrorMsg}
+        <div class="error-banner">{editErrorMsg}</div>
+      {/if}
+
+      <label>
+        Name (optional)
+        <input bind:value={editForm.name} placeholder="e.g. My SSH Tunnel" />
+      </label>
+      <label>
+        Protocol
+        <select bind:value={editForm.protocol} disabled={editingRule.enabled}>
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
+        </select>
+      </label>
+      <label>
+        Listen Address
+        <input bind:value={editForm.listen_addr} placeholder="0.0.0.0:8080" disabled={editingRule.enabled} />
+      </label>
+      <label>
+        Target Address
+        <input bind:value={editForm.target_addr} placeholder="192.168.1.1:80" disabled={editingRule.enabled} />
+      </label>
+
+      {#if editingRule.enabled}
+        <div class="info-banner">Stop the rule to edit addresses and protocol.</div>
+      {/if}
+
+      <div class="modal-actions">
+        <button class="btn-secondary" onclick={cancelEdit}>Cancel</button>
+        <button class="btn-primary" onclick={saveEdit}>Save</button>
       </div>
     </div>
   </div>
@@ -340,20 +415,25 @@
     font-size: 14px;
     background: #0f1117;
     color: #e2e8f0;
+    user-select: none;
   }
 
   .app {
     max-width: 1100px;
     margin: 0 auto;
-    padding: 32px 24px;
+    padding: 24px 24px 0;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
   }
 
   header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 24px;
+    margin-bottom: 16px;
     gap: 12px;
+    flex-shrink: 0;
   }
 
   h1 {
@@ -370,24 +450,12 @@
     gap: 8px;
   }
 
-  .search {
-    padding: 7px 12px;
-    background: #1a1d27;
-    border: 1px solid #2d3148;
-    border-radius: 6px;
-    color: #e2e8f0;
-    font-size: 13px;
-    outline: none;
-    width: 180px;
-  }
-  .search:focus { border-color: #3b82f6; }
-  .search::placeholder { color: #475569; }
-
   .table-wrap {
     background: #1a1d27;
     border-radius: 10px;
     border: 1px solid #2d3148;
     overflow: hidden;
+    flex-shrink: 0;
   }
 
   .empty {
@@ -419,7 +487,7 @@
   }
 
   tr:last-child td { border-bottom: none; }
-  tr:hover td { background: #1e2235; }
+  tr:hover td { background: #1e2235; cursor: pointer; }
 
   .mono { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 13px; }
   .dim { color: #64748b; }
@@ -474,6 +542,52 @@
   .btn-danger { background: #1f1f1f; color: #f87171; border: 1px solid #3f1f1f; }
   .btn-danger:hover:not(:disabled) { background: #3f1f1f; }
 
+  /* Log panel */
+  .log-panel {
+    margin-top: 16px;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: #1a1d27;
+    border: 1px solid #2d3148;
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 24px;
+  }
+
+  .log-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    border-bottom: 1px solid #2d3148;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #64748b;
+    flex-shrink: 0;
+  }
+
+  .log-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    color: #94a3b8;
+  }
+
+  .log-line {
+    padding: 2px 0;
+    border-bottom: 1px solid #1a1d27;
+    white-space: pre-wrap;
+    word-break: break-all;
+    line-height: 1.6;
+  }
+
+  /* Modals */
   .overlay {
     position: fixed;
     inset: 0;
@@ -495,39 +609,6 @@
     gap: 16px;
   }
 
-  .modal-logs {
-    width: 700px;
-    max-width: 90vw;
-    padding: 20px;
-    gap: 12px;
-  }
-
-  .logs-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .logs-body {
-    background: #0f1117;
-    border: 1px solid #2d3148;
-    border-radius: 6px;
-    padding: 12px;
-    max-height: 60vh;
-    overflow-y: auto;
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    font-size: 12px;
-    color: #94a3b8;
-  }
-
-  .log-line {
-    padding: 2px 0;
-    border-bottom: 1px solid #1e2235;
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-  .log-line:last-child { border-bottom: none; }
-
   .modal h2 { margin: 0; font-size: 16px; font-weight: 600; color: #f1f5f9; }
 
   .modal label {
@@ -548,6 +629,7 @@
     outline: none;
   }
   .modal input:focus, .modal select:focus { border-color: #3b82f6; }
+  .modal input:disabled, .modal select:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
 
@@ -555,6 +637,15 @@
     background: #3f1f1f;
     border: 1px solid #7f1d1d;
     color: #fca5a5;
+    padding: 10px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+  }
+
+  .info-banner {
+    background: #1e2d3d;
+    border: 1px solid #1e3a5f;
+    color: #93c5fd;
     padding: 10px 14px;
     border-radius: 6px;
     font-size: 13px;

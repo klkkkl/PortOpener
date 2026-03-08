@@ -93,6 +93,33 @@ async fn get_logs(state: State<'_, SharedState>, limit: usize) -> Result<Vec<Str
     Ok(s.read_logs(limit))
 }
 
+#[derive(Deserialize)]
+pub struct UpdateRuleRequest {
+    id: String,
+    name: String,
+    protocol: Protocol,
+    listen_addr: String,
+    target_addr: String,
+}
+
+#[tauri::command]
+async fn update_rule(
+    state: State<'_, SharedState>,
+    req: UpdateRuleRequest,
+) -> Result<(), String> {
+    let mut s = state.lock().await;
+    if s.is_running(&req.id) {
+        return Err("Stop the rule before editing it".into());
+    }
+    let rule = s.rules.get_mut(&req.id).ok_or("Rule not found")?;
+    rule.name = req.name;
+    rule.protocol = req.protocol;
+    rule.listen_addr = req.listen_addr;
+    rule.target_addr = req.target_addr;
+    s.save_rules()?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let config_dir = dirs::config_dir()
@@ -121,6 +148,7 @@ pub fn run() {
             export_rules,
             import_rules,
             get_logs,
+            update_rule,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

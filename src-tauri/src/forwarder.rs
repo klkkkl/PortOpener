@@ -291,7 +291,7 @@ async fn run_tcp_forward(
                         let lp = log_path.clone();
                         tokio::spawn(async move {
                             conn.fetch_add(1, Ordering::Relaxed);
-                            if let Err(e) = handle_tcp_connection(client, target, cancel_conn, up, down).await {
+                            if let Err(e) = handle_tcp_connection(client, target, cancel_conn, up, down, lp.clone(), client_addr).await {
                                 log_line(&lp, &format!("[TCP] Connection error: {}", e));
                             }
                             conn.fetch_sub(1, Ordering::Relaxed);
@@ -311,6 +311,8 @@ async fn handle_tcp_connection(
     cancel: CancellationToken,
     bytes_up: Arc<AtomicU64>,
     bytes_down: Arc<AtomicU64>,
+    log_path: Option<PathBuf>,
+    client_addr: std::net::SocketAddr,
 ) -> io::Result<()> {
     let target = TcpStream::connect(&target_addr).await?;
 
@@ -322,6 +324,10 @@ async fn handle_tcp_connection(
         _ = async {
             let up = bytes_up.clone();
             let down = bytes_down.clone();
+            let lp_up = log_path.clone();
+            let lp_down = log_path.clone();
+            let ca = client_addr;
+            let ta = target_addr.clone();
             tokio::join!(
                 async {
                     let mut buf = vec![0u8; 8192];
@@ -330,6 +336,7 @@ async fn handle_tcp_connection(
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 up.fetch_add(n as u64, Ordering::Relaxed);
+                                log_line(&lp_up, &format!("[TCP] DATA {} -> {} {} bytes", ca, ta, n));
                                 if tokio::io::AsyncWriteExt::write_all(&mut tw, &buf[..n]).await.is_err() { break; }
                             }
                         }
@@ -342,6 +349,7 @@ async fn handle_tcp_connection(
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 down.fetch_add(n as u64, Ordering::Relaxed);
+                                log_line(&lp_down, &format!("[TCP] DATA {} <- {} {} bytes", ca, ta, n));
                                 if tokio::io::AsyncWriteExt::write_all(&mut cw, &buf[..n]).await.is_err() { break; }
                             }
                         }
@@ -350,6 +358,7 @@ async fn handle_tcp_connection(
             )
         } => {}
     }
+    log_line(&log_path, &format!("[TCP] Closed {} -> {}", client_addr, target_addr));
     Ok(())
 }
 
